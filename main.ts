@@ -2,6 +2,11 @@
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
 //
+// Why this file stays boring on purpose: the grader only ever talks to the server app.ts builds.
+// This module's only job is the handshake — claim a port, announce it, wait for "done". Everything
+// else in here (timeouts, retries, backoff) exists so a slow or restarting env can't strand the
+// process before the trial finishes.
+//
 //   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
 //      there is nothing to talk to, so the program exits 1 at once.
 //   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
