@@ -31,7 +31,10 @@ function sendErr(res: ServerResponse, status: number, message: string): void {
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => { chunks.push(c); if (Buffer.concat(chunks).length > 64 * 1024 * 1024) req.destroy(new Error('body too large')); });
+    // Track the length incrementally: concat-ing the accumulated chunks on
+    // every data event is quadratic for large bodies (a 600-object push).
+    let total = 0;
+    req.on('data', (c: Buffer) => { chunks.push(c); total += c.length; if (total > 64 * 1024 * 1024) req.destroy(new Error('body too large')); });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });

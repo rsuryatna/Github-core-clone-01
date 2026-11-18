@@ -391,7 +391,9 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObj | u
   };
   for (const e of raw) {
     const obj = resolve(e);
-    objects.set(hashObject(obj.type, obj.data), obj);
+    // resolve() already hashed this object into entry.oid; re-hashing here
+    // would pay a second SHA-1 per object on every push.
+    objects.set(e.oid!, obj);
   }
   return objects;
 }

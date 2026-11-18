@@ -64,6 +64,36 @@ function v2Advertisement(): Buffer {
     'flush',
   ]);
 }
+// The v2 advertisement never depends on repo state: build it once.
+const V2_ADVERTISEMENT = v2Advertisement();
+
+// ---------------------------------------------------------------- fetch cache
+// An upload-pack fetch response is a pure function of (repo.objects, args):
+// objects are content-addressed and append-only — never deleted or mutated —
+// so when repo.objects.size is unchanged, the reachable set for the same args
+// is identical, and writePack is deterministic. Memoizing the response turns
+// 50 identical depth-1 clones into one pack build. The cache holds derived
+// bytes only and never enters the state export.
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 128;
+function fetchCacheKey(repo: Repo, a: FetchArgs, protocol: string): string {
+  const s = (xs: string[]): string => [...xs].sort().join(',');
+  return `${protocol}|${repo.objects.size}|${s(a.wants)}|${s(a.haves)}|${s(a.shallows)}|${a.deepen ?? ''}|${a.filter ?? ''}|${a.thinPack ? 1 : 0}`;
+}
+function fetchCached(repo: Repo, a: FetchArgs, protocol: string, build: () => Buffer): Buffer {
+  let perRepo = fetchCache.get(repo);
+  if (!perRepo) { perRepo = new Map(); fetchCache.set(repo, perRepo); }
+  const key = fetchCacheKey(repo, a, protocol);
+  const hit = perRepo.get(key);
+  if (hit) return hit;
+  const built = build();
+  if (perRepo.size >= FETCH_CACHE_MAX) {
+    const oldest = perRepo.keys().next();
+    if (!oldest.done) perRepo.delete(oldest.value);
+  }
+  perRepo.set(key, built);
+  return built;
+}
 
 export function handleInfoRefs(repo: Repo | undefined, service: string, protocol: string): { status: number; body: Buffer; contentType: string } {
   if (!repo) return { status: 404, body: Buffer.from(JSON.stringify({ message: 'Not Found' })), contentType: 'application/json' };
@@ -74,7 +104,7 @@ export function handleInfoRefs(repo: Repo | undefined, service: string, protocol
     return { status: 400, body: Buffer.from(JSON.stringify({ message: 'Unknown service' })), contentType: 'application/json' };
   }
   if (protocol === 'version=2') {
-    return { status: 200, body: v2Advertisement(), contentType: 'application/x-git-upload-pack-advertisement' };
+    return { status: 200, body: V2_ADVERTISEMENT, contentType: 'application/x-git-upload-pack-advertisement' };
   }
   return { status: 200, body: v0Advertisement(repo, 'git-upload-pack', UPLOAD_CAPS_V0), contentType: 'application/x-git-upload-pack-advertisement' };
 }
@@ -196,6 +226,10 @@ function fetchV2Response(repo: Repo, args: Map<string, string[]>): Buffer {
     deepen: args.has('deepen') ? parseInt(args.get('deepen')![0] ?? '0', 10) : null,
     filter: args.get('filter')?.[0] ?? null, thinPack: args.has('thin-pack'),
   };
+  return fetchCached(repo, a, 'v2', () => buildFetchV2Response(repo, a));
+}
+
+function buildFetchV2Response(repo: Repo, a: FetchArgs): Buffer {
   const { pack, shallow, unshallow } = packForFetch(repo, a);
   const parts: Buffer[] = [];
   // The acknowledgments section is only sent when the client negotiated with
@@ -240,6 +274,10 @@ function fetchV0Response(repo: Repo, packets: Packet[]): Buffer {
     else if (line.startsWith('shallow ')) shallows.push(line.slice(8).trim());
   }
   const a: FetchArgs = { wants, haves, shallows, deepen, filter: null, thinPack: false };
+  return fetchCached(repo, a, 'v0', () => buildFetchV0Response(repo, a));
+}
+
+function buildFetchV0Response(repo: Repo, a: FetchArgs): Buffer {
   const { pack, shallow, unshallow } = packForFetch(repo, a);
   const parts: Buffer[] = [pktLine('NAK\n')];
   for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
