@@ -1,27 +1,30 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// The entry <-> env lifecycle, as the harness settles it: claim a port, tell
+// the env which port, then poll until the env says the trial is over and
+// exit 0. This entrypoint does no serving itself — the Go core in ./forge
+// does all of that. Its only job is the handshake with the env.
 //
-// Why this file stays boring on purpose: the grader only ever talks to the server app.ts builds.
-// This module's only job is the handshake — claim a port, announce it, wait for "done". Everything
-// else in here (timeouts, retries, backoff) exists so a slow or restarting env can't strand the
-// process before the trial finishes.
-//
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
-//
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+//   1. MAKEFUN_ENV_URL names the env's origin. Without it there is nothing
+//      to talk to, so the program exits 1 at once.
+//   2. Spawn ./forge with no arguments. It binds an ephemeral port on
+//      127.0.0.1 and prints "listening on port N" to its stdout. Reading
+//      the port back from the child avoids the race of picking a port,
+//      closing the socket, and hoping nothing else takes it first. Never
+//      bind 8080 — the env owns it.
+//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the
+//      address the request came from plus N as the base URL and dials it
+//      from then on. The first register wins; a 409 means another entry
+//      already registered, and this process keeps waiting like any other.
+//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env
+//      answers at once ({"done": false} while the suite runs), so this is
+//      a poll, not a long-held request. A failed or slow poll is retried
+//      with a short exponential backoff; the process never exits before
+//      the env says done.
+//   5. Stop the child and exit 0. The harness then stops the env, which
+//      writes the export the scorer reads.
 
-import { createApp } from './app.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
@@ -40,6 +43,37 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+}
+
+/**
+ * Start ./forge and read the port it bound from its stdout. The child's
+ * stdout is forwarded to our own stdout as it arrives; the first line of
+ * the form "listening on port N" is the port. If the child exits before
+ * printing it, starting the server failed and the program ends.
+ */
+function startForge(): Promise<{ child: ChildProcess; port: number }> {
+  const forgePath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'forge');
+  const child = spawn(forgePath, [], { stdio: ['ignore', 'pipe', 'inherit'] });
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    let settled = false;
+    child.stdout!.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
+      process.stdout.write(text);
+      buf += text;
+      const m = buf.match(/listening on port (\d+)/);
+      if (m && !settled) {
+        settled = true;
+        resolve({ child, port: Number(m[1]) });
+      }
+    });
+    child.once('exit', (code) => {
+      if (!settled) reject(new Error(`forge exited before listening (code ${code})`));
+    });
+    child.once('error', (err) => {
+      if (!settled) reject(err);
+    });
+  });
 }
 
 /**
@@ -81,22 +115,16 @@ async function waitForDone(): Promise<void> {
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
+/** Start the Go core, register its port, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  const { child, port } = await startForge();
+  process.stdout.write(`[entry] forge listening on port ${port}\n`);
 
-  await register(address.port);
+  await register(port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
   await waitForDone();
-  server.close();
+  child.kill('SIGTERM');
   process.stdout.write('[entry] done\n');
 }
 
