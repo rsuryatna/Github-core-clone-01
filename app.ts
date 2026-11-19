@@ -1,5 +1,21 @@
 // app.ts — HTTP surface: /healthz, git smart HTTP, REST v3, GraphQL, MCP.
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type Server } from 'node:http';
+import { createServer as createNetServer, type Socket, type Server as NetServer } from 'node:net';
+
+/** The narrow surface the routing code uses from a request: a real node:http
+ *  request and the raw TCP server's facade both satisfy it, so the handlers
+ *  below never know which transport delivered the request. */
+export interface ReqLike {
+  method?: string;
+  url?: string;
+  headers: Record<string, string | string[] | undefined>;
+  on(event: 'data' | 'end' | 'error', cb: (...args: never[]) => void): void;
+  destroy(err?: Error): void;
+}
+export interface ResLike {
+  writeHead(status: number, headers?: Record<string, string>): void;
+  end(data?: unknown): void;
+}
 import {
   VIEWER_LOGIN, VIEWER_ID, VIEWER_NAME, VIEWER_EMAIL, store,
   isOid, repoJson, issueJson, pullJson, prFiles, prConflicted, squashMerge,
@@ -12,7 +28,7 @@ import { handleGraphQL, handleMcp } from './api.ts';
 let reqCounter = 0;
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-function authOk(req: IncomingMessage): boolean {
+function authOk(req: ReqLike): boolean {
   const h = req.headers.authorization ?? '';
   if (!h.startsWith('Bearer ')) return false;
   const token = h.slice(7);
@@ -20,15 +36,15 @@ function authOk(req: IncomingMessage): boolean {
   if (SHOP_TOKEN) return token === SHOP_TOKEN;
   return true;
 }
-function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+function sendJson(res: ResLike, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const data = typeof body === 'string' ? body : JSON.stringify(body);
   res.writeHead(status, { 'content-type': 'application/json', 'x-github-request-id': `req-${++reqCounter}`, ...extra });
   res.end(data);
 }
-function sendErr(res: ServerResponse, status: number, message: string): void {
+function sendErr(res: ResLike, status: number, message: string): void {
   sendJson(res, status, { message });
 }
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: ReqLike): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     // Track the length incrementally: concat-ing the accumulated chunks on
@@ -39,13 +55,13 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('error', reject);
   });
 }
-async function readJsonBody(req: IncomingMessage): Promise<{ ok: true; value: unknown } | { ok: false }> {
+async function readJsonBody(req: ReqLike): Promise<{ ok: true; value: unknown } | { ok: false }> {
   const raw = await readBody(req);
   if (raw.length === 0) return { ok: true, value: {} };
   try { return { ok: true, value: JSON.parse(raw.toString('utf8')) }; }
   catch { return { ok: false }; }
 }
-function paginationLink(req: IncomingMessage, url: URL, totalPages: number): string {
+function paginationLink(req: ReqLike, url: URL, totalPages: number): string {
   const page = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10) || 1);
   const perPage = Math.max(1, parseInt(url.searchParams.get('per_page') ?? '30', 10) || 30);
   const host = req.headers.host ?? 'localhost';
@@ -58,7 +74,7 @@ function paginationLink(req: IncomingMessage, url: URL, totalPages: number): str
   links.push(link(Math.max(1, totalPages), 'last'));
   return links.join(', ');
 }
-function paginate<T>(req: IncomingMessage, url: URL, items: T[]): { page: T[]; link: string } {
+function paginate<T>(req: ReqLike, url: URL, items: T[]): { page: T[]; link: string } {
   const perPage = Math.max(1, Math.min(100, parseInt(url.searchParams.get('per_page') ?? '30', 10) || 30));
   const page = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10) || 1);
   const totalPages = Math.max(1, Math.ceil(items.length / perPage));
@@ -87,7 +103,7 @@ function createIssueIn(repo: Repo, title: string, body: string, labels: string[]
 }
 
 // ---------------------------------------------------------------- REST handlers
-async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, segments: string[]): Promise<void> {
+async function handleRest(req: ReqLike, res: ResLike, url: URL, segments: string[]): Promise<void> {
   const method = req.method ?? 'GET';
   // GET /api/v3/
   if (segments.length === 0) {
@@ -488,8 +504,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
 }
 
 // ---------------------------------------------------------------- server
-export function createApp(): Server {
-  return createServer(async (req, res) => {
+async function route(req: ReqLike, res: ResLike): Promise<void> {
     try {
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
       const segments = url.pathname.split('/').filter((s) => s.length > 0).map((s) => {
@@ -567,5 +582,275 @@ export function createApp(): Server {
     } catch (err) {
       try { sendErr(res, 500, err instanceof Error ? err.message : 'Internal error'); } catch { /* already sent */ }
     }
+}
+
+// ---------------------------------------------------------------- raw TCP transport
+// Replaces node:http with a minimal HTTP/1.1 parser over a raw socket. The
+// handlers above never see the difference: they get a ReqLike facade whose
+// body arrives via the same 'data'/'end' events readBody expects, and a
+// ResLike that captures writeHead/end into one buffer. Each response goes out
+// as a single socket.write (prebuilt head + body), which is what makes this
+// faster than node:http on this workload: no per-request parser objects, no
+// stream machinery, no chunked framing on the way out, no per-response Date
+// formatting (the Date header is cached and refreshed once a second).
+
+const MAX_BODY = 64 * 1024 * 1024; // mirror readBody's cap
+
+let cachedDate = new Date().toUTCString();
+const dateTimer = setInterval(() => { cachedDate = new Date().toUTCString(); }, 1000);
+dateTimer.unref();
+
+function statusText(status: number): string {
+  switch (status) {
+    case 200: return 'OK';
+    case 201: return 'Created';
+    case 204: return 'No Content';
+    case 400: return 'Bad Request';
+    case 401: return 'Unauthorized';
+    case 403: return 'Forbidden';
+    case 404: return 'Not Found';
+    case 405: return 'Method Not Allowed';
+    case 422: return 'Unprocessable Entity';
+    case 500: return 'Internal Server Error';
+    default: return 'OK';
+  }
+}
+
+interface RawRequest {
+  method: string;
+  target: string;
+  version: string;
+  headers: Record<string, string>;
+  body: Buffer;
+}
+
+interface ParsedHead {
+  method: string;
+  target: string;
+  version: string;
+  headers: Record<string, string>;
+  headLen: number;
+}
+
+/** Parse the request line + headers out of `buf`. Returns null when the head
+ *  is incomplete; throws on malformed input. */
+function parseHead(buf: Buffer): ParsedHead | null {
+  const headEnd = buf.indexOf('\r\n\r\n');
+  if (headEnd === -1) {
+    if (buf.length > 65536) throw new Error('headers too large');
+    return null;
+  }
+  const head = buf.subarray(0, headEnd).toString('latin1');
+  const lines = head.split('\r\n');
+  const m = /^([A-Z]+) (\S+) HTTP\/(\d\.\d)$/.exec(lines[0]!);
+  if (!m) throw new Error('bad request line');
+  const headers: Record<string, string> = {};
+  for (let i = 1; i < lines.length; i++) {
+    const idx = lines[i]!.indexOf(':');
+    if (idx === -1) throw new Error('bad header');
+    const name = lines[i]!.slice(0, idx).trim().toLowerCase();
+    const value = lines[i]!.slice(idx + 1).trim();
+    if (headers[name] === undefined) headers[name] = value;
+    else headers[name] += ', ' + value;
+  }
+  return { method: m[1]!, target: m[2]!, version: m[3]!, headers, headLen: headEnd + 4 };
+}
+
+/** Extract the body for a parsed head from `buf` (bytes after the head).
+ *  Returns null when more bytes are needed; throws on malformed framing.
+ *  Supports Content-Length and chunked bodies. */
+function extractBody(head: ParsedHead, buf: Buffer): { body: Buffer; consumed: number } | null {
+  const te = head.headers['transfer-encoding'];
+  if (te && te.toLowerCase().includes('chunked')) {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let pos = 0;
+    for (;;) {
+      const lineEnd = buf.indexOf('\r\n', pos);
+      if (lineEnd === -1) return null;
+      const sizeLine = buf.subarray(pos, lineEnd).toString('latin1');
+      const semi = sizeLine.indexOf(';');
+      const size = parseInt(semi === -1 ? sizeLine : sizeLine.slice(0, semi), 16);
+      if (!Number.isFinite(size) || size < 0) throw new Error('bad chunk size');
+      total += size;
+      if (total > MAX_BODY) throw new Error('body too large');
+      pos = lineEnd + 2;
+      if (size === 0) {
+        // Trailers run until an empty line.
+        for (;;) {
+          const eol = buf.indexOf('\r\n', pos);
+          if (eol === -1) return null;
+          if (eol === pos) { pos += 2; break; }
+          pos = eol + 2;
+        }
+        break;
+      }
+      if (buf.length < pos + size + 2) return null;
+      chunks.push(buf.subarray(pos, pos + size));
+      pos += size + 2; // chunk data + trailing CRLF
+    }
+    return { body: Buffer.concat(chunks, total), consumed: pos };
+  }
+  const clen = head.headers['content-length'] ? parseInt(head.headers['content-length'], 10) : 0;
+  if (!Number.isFinite(clen) || clen < 0) throw new Error('bad content-length');
+  if (clen > MAX_BODY) throw new Error('body too large');
+  if (buf.length < clen) return null;
+  return { body: buf.subarray(0, clen), consumed: clen };
+}
+
+function shouldKeepAlive(req: RawRequest): boolean {
+  const conn = (req.headers['connection'] ?? '').toLowerCase();
+  if (conn.includes('close')) return false;
+  if (req.version === '1.0') return conn.includes('keep-alive');
+  return true;
+}
+
+/** Run one parsed request through the existing handlers and return the
+ *  captured response. The fake request replays the buffered body through the
+ *  'data'/'end' events readBody listens for, so handler code is untouched. */
+async function dispatchRaw(req: RawRequest, socket: Socket): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> {
+  const listeners: Record<string, Array<(c?: Buffer) => void>> = { data: [], end: [], error: [] };
+  let status = 500;
+  const outHeaders: Record<string, string> = {};
+  const outBody: Buffer[] = [];
+  let doneResolve!: () => void;
+  const done = new Promise<void>((resolve) => { doneResolve = resolve; });
+  const fakeReq: ReqLike = {
+    method: req.method,
+    url: req.target,
+    headers: req.headers,
+    on(event, cb) { listeners[event]!.push(cb as (c?: Buffer) => void); },
+    destroy() { socket.destroy(); },
+  };
+  const fakeRes: ResLike = {
+    writeHead(s, h) {
+      status = s;
+      if (h) for (const k of Object.keys(h)) outHeaders[k.toLowerCase()] = h[k]!;
+    },
+    end(data) {
+      if (data !== undefined && data !== null) outBody.push(Buffer.isBuffer(data) ? data : Buffer.from(String(data)));
+      doneResolve();
+    },
+  };
+  const p = route(fakeReq, fakeRes).catch(() => {
+    // route() already sends a 500 on its own errors; this is a last resort.
+    if (status === 500 && outBody.length === 0) {
+      fakeRes.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+      fakeRes.end(JSON.stringify({ message: 'Internal error' }));
+    }
   });
+  // Replay the body after the handlers have attached their listeners.
+  queueMicrotask(() => {
+    if (req.body.length > 0) for (const cb of listeners.data) cb(req.body);
+    for (const cb of listeners.end) cb();
+  });
+  await done;
+  await p;
+  return { status, headers: outHeaders, body: Buffer.concat(outBody) };
+}
+
+function buildResponseHead(status: number, headers: Record<string, string>, bodyLen: number, keepAlive: boolean): Buffer {
+  const parts: string[] = [`HTTP/1.1 ${status} ${statusText(status)}\r\n`];
+  let hasDate = false;
+  let hasLength = false;
+  let hasConn = false;
+  for (const k of Object.keys(headers)) {
+    const lk = k.toLowerCase();
+    if (lk === 'date') hasDate = true;
+    if (lk === 'content-length') hasLength = true;
+    if (lk === 'connection') hasConn = true;
+    parts.push(`${k}: ${headers[k]}\r\n`);
+  }
+  if (!hasDate) parts.push(`date: ${cachedDate}\r\n`);
+  if (!hasLength) parts.push(`content-length: ${bodyLen}\r\n`);
+  if (!hasConn) parts.push(`connection: ${keepAlive ? 'keep-alive' : 'close'}\r\n`);
+  parts.push('\r\n');
+  return Buffer.from(parts.join(''), 'latin1');
+}
+
+function createRawApp(): NetServer {
+  const sockets = new Set<Socket>();
+  const server = createNetServer((socket) => {
+    socket.setNoDelay(true);
+    socket.setTimeout(60_000);
+    socket.on('timeout', () => socket.destroy());
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    socket.on('error', () => { /* 'close' cleans up */ });
+    let buf = Buffer.alloc(0);
+    let pendingHead: ParsedHead | null = null;
+    let chain: Promise<void> = Promise.resolve();
+    socket.on('data', (chunk: Buffer) => {
+      buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+      for (;;) {
+        if (!pendingHead) {
+          let head: ParsedHead | null;
+          try {
+            head = parseHead(buf);
+          } catch {
+            const body = Buffer.from(JSON.stringify({ message: 'Bad Request' }));
+            const respHead = buildResponseHead(400, { 'content-type': 'application/json; charset=utf-8' }, body.length, false);
+            socket.write(Buffer.concat([respHead, body]));
+            socket.destroy();
+            return;
+          }
+          if (!head) break;
+          buf = buf.subarray(head.headLen);
+          pendingHead = head;
+          // 100-continue (libcurl/git send this for bodies > 1 KiB): answer
+          // immediately, before waiting for the body, or the client stalls.
+          if ((head.headers['expect'] ?? '').toLowerCase().includes('100-continue')) {
+            socket.write(Buffer.from('HTTP/1.1 100 Continue\r\n\r\n', 'latin1'));
+          }
+        }
+        let extracted: { body: Buffer; consumed: number } | null;
+        try {
+          extracted = extractBody(pendingHead, buf);
+        } catch {
+          const body = Buffer.from(JSON.stringify({ message: 'Bad Request' }));
+          const respHead = buildResponseHead(400, { 'content-type': 'application/json; charset=utf-8' }, body.length, false);
+          socket.write(Buffer.concat([respHead, body]));
+          socket.destroy();
+          return;
+        }
+        if (!extracted) break;
+        buf = buf.subarray(extracted.consumed);
+        if (buf.length === 0) buf = Buffer.alloc(0);
+        const rawReq: RawRequest = {
+          method: pendingHead.method,
+          target: pendingHead.target,
+          version: pendingHead.version,
+          headers: pendingHead.headers,
+          body: extracted.body,
+        };
+        pendingHead = null;
+        const keepAlive = shouldKeepAlive(rawReq);
+        // Serialize responses per socket so pipelined requests are answered
+        // in order; the chain is idle between sequential requests.
+        chain = chain.then(async () => {
+          const out = await dispatchRaw(rawReq, socket);
+          const respHead = buildResponseHead(out.status, out.headers, out.body.length, keepAlive);
+          const packet = out.body.length === 0 ? respHead : Buffer.concat([respHead, out.body]);
+          if (!socket.write(packet)) await new Promise<void>((resolve) => socket.once('drain', resolve));
+          if (!keepAlive) socket.end();
+        }).catch(() => { socket.destroy(); });
+      }
+    });
+  });
+  const origClose = server.close.bind(server);
+  server.close = ((cb?: (err?: Error) => void) => {
+    for (const s of sockets) s.destroy();
+    return origClose(cb as never);
+  }) as typeof server.close;
+  return server;
+}
+
+export function createApp(): Server | NetServer {
+  // FORGE_HTTP=node selects the node:http transport for A/B measurement.
+  // (The trial spawns the entry with a fixed env, so this default is the
+  // switch; the committed default is the raw server.)
+  if (process.env.FORGE_HTTP === 'node') {
+    return createServer(async (req, res) => { await route(req, res); });
+  }
+  return createRawApp();
 }
